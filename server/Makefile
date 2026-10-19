@@ -10,7 +10,7 @@ SRC_FILES=$(foreach dir,$(SRC_DIRS),$(wildcard $(dir)/*.c))
 SRC_NAMES=$(foreach file,$(SRC_FILES),$(notdir $(file)))
 OBJ_FILES=$(foreach name,$(SRC_NAMES),$(patsubst %.c,${BUILD_DIR}/%.o,$(name)))
 LDFLAGS=
-CFLAGS= -g
+CFLAGS= -g -O0
 VPATH = $(SRC_DIRS)
 
 all: ${BUILD_DIR} $(OBJ_FILES)

@@ -65,7 +65,7 @@ static int getPort(struct addrinfo* info) {
 
 #define FILE_DIR "/var/tmp/"
 static const char* filePath = FILE_DIR "aesdsocketdata";
-static volatile sig_atomic_t exitFlag = 0;
+static volatile sig_atomic_t signalFlag = 0;
 
 struct main_ctx_t {
     int sock;
@@ -85,7 +85,17 @@ static struct main_ctx_t ctx = {
 
 static void signalHandler(int sig) {
     DEBUG_LOG("Caught signal, exiting");
-    exitFlag = 1;
+    signalFlag = 1;
+}
+
+static void teardown(int ec, int err) {
+    if (ec == EXIT_FAILURE) {
+        if (signalFlag && (err == EINTR)) {
+            // Graceful termination via signal
+            ec = EXIT_SUCCESS;
+        }
+    }
+    exit(ec);
 }
 
 static void startDaemon(void) {
@@ -98,11 +108,11 @@ static void startDaemon(void) {
 
         if (setsid() == -1) {
             ERROR_LOG("Failed to create session: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         if (chdir("/") == -1 ) {
             ERROR_LOG("Failed to set working dir: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
 
         // Close STDIO related files.
@@ -114,24 +124,27 @@ static void startDaemon(void) {
         int fd = open("/dev/null", O_RDWR);
         if (fd == -1) {
             ERROR_LOG("Failed to open /dev/null: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         if (dup2(fd, STDIN_FILENO) == -1) {
             ERROR_LOG("Failed to redirect stdin: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         if (dup2(fd, STDOUT_FILENO) == -1) {
             ERROR_LOG("Failed to redirect stdout: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         if (dup2(fd, STDERR_FILENO) == -1) {
             ERROR_LOG("Failed to redirect stderr: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
+        }
+        if (fd > STDERR_FILENO) {
+            (void)close(fd);
         }
     } else if (pid < 0) {
         // Failed to fork
         ERROR_LOG("Failed to fork: %s", strerror(errno));
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, errno);
     }
     else {
         // Parent process
@@ -175,38 +188,38 @@ int main(int argc, const char* argv[]) {
             daemon = true;
         } else {
             ERROR_LOG("Arg should be \"-d\"");
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, 0);
         }
     } else if (argc != 1) {
         ERROR_LOG("Invalid args: Only \"-d\" supported");
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, 0);
     }
 
     if (atexit(&onExit) != 0) {
         ERROR_LOG("Failed to register exit handler");
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, 0);
     }
 
     sigAction.sa_handler = &signalHandler;
     if (sigaction(SIGINT, &sigAction, NULL) == -1) {
-        ERROR_LOG("Failed to set SIGINT handler");
-        exit(EXIT_FAILURE);
+        ERROR_LOG("Failed to set SIGINT handler: %s", strerror(errno));
+        teardown(EXIT_FAILURE, errno);
     }
 
     if (sigaction(SIGTERM, &sigAction, NULL) == -1) {
-        ERROR_LOG("Failed to set SIGTERM handler");
-        exit(EXIT_FAILURE);
+        ERROR_LOG("Failed to set SIGTERM handler: %s", strerror(errno));
+        teardown(EXIT_FAILURE, errno);
     }
 
     if (system("mkdir -p " FILE_DIR) != 0) {
         ERROR_LOG("Failed to mkdir %s: %s", FILE_DIR, strerror(errno));
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, errno);
     }
 
     ctx.file = open(filePath, O_CREAT|O_TRUNC|O_RDWR|O_APPEND, S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH);
     if (ctx.file == -1) {
         ERROR_LOG("Failed to open %s: %s", filePath, strerror(errno));
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, errno);
     }
 
     memset(&hints, 0, sizeof(hints));
@@ -220,26 +233,26 @@ int main(int argc, const char* argv[]) {
         ctx.sock = socket(ctx.addrInfo->ai_family, ctx.addrInfo->ai_socktype, ctx.addrInfo->ai_protocol);
         if (ctx.sock == -1) {
             ERROR_LOG("Failed to open socket: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         DEBUG_LOG("Server socket opened");
 
         int optVal = 1;
         if (setsockopt(ctx.sock, SOL_SOCKET, SO_REUSEADDR, &optVal, sizeof(optVal)) == -1) {
             ERROR_LOG("Failed to set socket option: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         DEBUG_LOG("Socket option SO_REUSEADDR set");
 
         if (setsockopt(ctx.sock, SOL_SOCKET, SO_REUSEPORT, &optVal, sizeof(optVal)) == -1) {
             ERROR_LOG("Failed to set socket option: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         DEBUG_LOG("Socket option SO_REUSEPORT set");
 
         if (bind(ctx.sock, ctx.addrInfo->ai_addr, getSockLen(ctx.addrInfo)) == -1) {
             ERROR_LOG("Failed to bind: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         DEBUG_LOG("Server socket bound to %s:%d", (serverAddrStr ? serverAddrStr : "-"), getPort(ctx.addrInfo));
 
@@ -249,11 +262,11 @@ int main(int argc, const char* argv[]) {
 
         if (listen(ctx.sock, 10) == -1) {
             ERROR_LOG("Failed to listen: %s", strerror(errno));
-            exit(EXIT_FAILURE);
+            teardown(EXIT_FAILURE, errno);
         }
         DEBUG_LOG("Server socket listen");
 
-        while (!exitFlag) {
+        while (!signalFlag) {
             struct sockaddr_in addr;
             socklen_t sockLen = sizeof(struct sockaddr_in);
             DEBUG_LOG("Server accepting new client...");
@@ -262,7 +275,7 @@ int main(int argc, const char* argv[]) {
                 char buf[256];
                 const char* clientAddrStr = inet_ntop(AF_INET, getAddrIpV4((struct sockaddr*)&addr), clientAddrBuf, sizeof(clientAddrBuf));
                 DEBUG_LOG("Accepted connection from %s", (clientAddrStr ? clientAddrStr: "-"));
-                while (!exitFlag) {
+                while (!signalFlag) {
                     // Receive packet from client
                     memset(buf, 0, sizeof(buf));
                     DEBUG_LOG("Receiving up to %ld bytes from client", sizeof(buf)-1);
@@ -282,29 +295,29 @@ int main(int argc, const char* argv[]) {
                                 numToWrite -= wrote;
                             } else {
                                 ERROR_LOG("Failed to write: %s", strerror(errno));
-                                exit(EXIT_FAILURE);
+                                teardown(EXIT_FAILURE, errno);
                             }
-                        } while (!exitFlag && numToWrite > 0);
+                        } while (!signalFlag && numToWrite > 0);
 
                         if (newLine) {
                             // Write back all contents to client
                             if (lseek(ctx.file, 0, SEEK_SET) == -1) {
                                 ERROR_LOG("Failed to seek: %s", strerror(errno));
-                                exit(EXIT_FAILURE);
+                                teardown(EXIT_FAILURE, errno);
                             }
                             do {
                                 numRead = read(ctx.file, buf, sizeof(buf));
                                 if (numRead == -1) {
                                     ERROR_LOG("Failed to read: %s", strerror(errno));
-                                    exit(EXIT_FAILURE);
+                                    teardown(EXIT_FAILURE, errno);
                                 }
                                 if (numRead > 0) {
                                     if (send(ctx.client, buf, numRead, 0) == -1) {
                                         ERROR_LOG("Failed to send: %s", strerror(errno));
-                                        exit(EXIT_FAILURE);
+                                        teardown(EXIT_FAILURE, errno);
                                     }
                                 }
-                            } while (!exitFlag && numRead > 0);
+                            } while (!signalFlag && numRead > 0);
 
                             close(ctx.client);
                             DEBUG_LOG("End of packet reached.");
@@ -319,19 +332,19 @@ int main(int argc, const char* argv[]) {
                         break;
                     } else {
                         ERROR_LOG("Failed to recv: %s", strerror(errno));
-                        exit(EXIT_FAILURE);
+                        teardown(EXIT_FAILURE, errno);
                     }
                 }
             } else {
                 ERROR_LOG("Failed to accept: %s", strerror(errno));
-                exit(EXIT_FAILURE);
+                teardown(EXIT_FAILURE, errno);
             }
         }
     } else {
         ERROR_LOG("Failed to build address: %s", gai_strerror(rc));
-        exit(EXIT_FAILURE);
+        teardown(EXIT_FAILURE, errno);
     }
 
-    exit(EXIT_SUCCESS);
+    teardown(EXIT_SUCCESS, 0);
     return 0;
 }
